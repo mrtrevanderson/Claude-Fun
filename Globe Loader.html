@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Globe Loader</title>
+<style>
+  :root {
+    --bg: oklch(0.97 0.005 90);
+    --fg: oklch(0.22 0.005 90);
+    --fg-soft: oklch(0.22 0.005 90 / 0.55);
+    --fg-faint: oklch(0.22 0.005 90 / 0.18);
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+  }
+  body {
+    display: grid;
+    place-items: center;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+  }
+  .stage {
+    position: relative;
+    display: grid;
+    place-items: center;
+  }
+  .stage svg.globe {
+    display: block;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+  }
+  .stage svg.globe:active { cursor: grabbing; }
+  .stage svg.whirl {
+    position: absolute;
+    inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    overflow: visible;
+  }
+  /* whirl rotations are applied to inner <g class="whirl-spin"> via CSS variable speeds */
+  .ring-a, .ring-b, .ring-c {
+    transform-origin: center center;
+    transform-box: fill-box;
+  }
+  .ring-a { animation: spin var(--whirl-a, 4.2s) linear infinite; }
+  .ring-b { animation: spinR var(--whirl-b, 6.5s) linear infinite; }
+  .ring-c { animation: spin var(--whirl-c, 9s) linear infinite; }
+  @keyframes spin  { to { transform: rotate(360deg); } }
+  @keyframes spinR { to { transform: rotate(-360deg); } }
+
+  .mote { fill: var(--fg-soft); }
+
+  .sphere {
+    fill: none;
+    stroke: var(--fg);
+    stroke-width: 1.25;
+  }
+  .graticule {
+    fill: none;
+    stroke: var(--fg);
+    stroke-width: 0.5;
+    stroke-opacity: 0.25;
+  }
+  .land {
+    fill: var(--fg);
+    fill-opacity: 0.92;
+    stroke: none;
+  }
+  .shade { fill: url(#shade); pointer-events: none; }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
+<script src="https://unpkg.com/topojson-client@3/dist/topojson-client.min.js"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo } = React;
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "size": 640,
+  "spinSpeed": 11,
+  "autoSpin": true,
+  "whirl": false,
+  "whirlScale": 1.8
+}/*EDITMODE-END*/;
+
+// Cache the world atlas across renders
+let worldPromise = null;
+function loadWorld() {
+  if (!worldPromise) {
+    worldPromise = fetch('https://unpkg.com/world-atlas@2/countries-110m.json')
+      .then(r => r.json())
+      .then(world => topojson.feature(world, world.objects.countries));
+  }
+  return worldPromise;
+}
+
+function GlobeLoader({ size, spinSpeed, autoSpin, whirl, whirlScale }) {
+  const W = size, H = size;
+  const R = size * 0.42;            // globe radius
+  const whirlSize = size * 1.4 * whirlScale;
+  const cx = whirlSize / 2;
+
+  const gratRef = useRef(null);
+  const landRef = useRef(null);
+  const svgRef = useRef(null);
+  const [land, setLand] = useState(null);
+
+  // rotation as a ref so the animation loop reads the latest without restarting
+  const rotRef = useRef([0, -15, 0]);
+  const autoRef = useRef(autoSpin);
+  useEffect(() => { autoRef.current = autoSpin; }, [autoSpin]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadWorld().then(l => { if (!cancelled) setLand(l); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Build projection / path; rebuild when size changes
+  const projection = useMemo(() => (
+    d3.geoOrthographic()
+      .scale(R)
+      .translate([W / 2, H / 2])
+      .clipAngle(90)
+      .rotate(rotRef.current)
+  ), [W, H, R]);
+  const pathGen = useMemo(() => d3.geoPath(projection), [projection]);
+  const graticule = useMemo(() => d3.geoGraticule10(), []);
+
+  // Animation loop
+  useEffect(() => {
+    let raf;
+    let last = performance.now();
+    function frame(now) {
+      const dt = (now - last) / 1000;
+      last = now;
+      if (autoRef.current) {
+        const r = rotRef.current;
+        rotRef.current = [r[0] + spinSpeed * dt, r[1], r[2]];
+      }
+      projection.rotate(rotRef.current);
+      if (gratRef.current) gratRef.current.setAttribute('d', pathGen(graticule) || '');
+      if (landRef.current && land) landRef.current.setAttribute('d', pathGen(land) || '');
+      raf = requestAnimationFrame(frame);
+    }
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [projection, pathGen, graticule, land, spinSpeed]);
+
+  // Drag handling — horizontal drag = longitude (lambda), vertical drag = latitude (phi)
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    let dragging = false;
+    let lastX = 0, lastY = 0;
+    let wasAuto = false;
+
+    const sensitivity = 0.5; // deg per pixel; scales with size implicitly via radius
+
+    function onDown(e) {
+      dragging = true;
+      wasAuto = autoRef.current;
+      autoRef.current = false; // pause auto-spin while dragging
+      lastX = e.clientX;
+      lastY = e.clientY;
+      el.setPointerCapture?.(e.pointerId);
+    }
+    function onMove(e) {
+      if (!dragging) return;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      const r = rotRef.current;
+      let lambda = r[0] + dx * sensitivity;
+      let phi    = r[1] - dy * sensitivity;
+      // clamp phi so the globe doesn't flip awkwardly
+      phi = Math.max(-89, Math.min(89, phi));
+      rotRef.current = [lambda, phi, r[2]];
+    }
+    function onUp(e) {
+      if (!dragging) return;
+      dragging = false;
+      autoRef.current = wasAuto; // resume previous auto state
+      el.releasePointerCapture?.(e.pointerId);
+    }
+
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+    el.addEventListener('pointerleave', onUp);
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onUp);
+      el.removeEventListener('pointerleave', onUp);
+    };
+  }, []);
+
+  return (
+    <div className="stage" style={{ width: size, height: size }}>
+      {whirl && (
+        <svg
+          className="whirl"
+          width={whirlSize}
+          height={whirlSize}
+          viewBox={`0 0 ${whirlSize} ${whirlSize}`}
+          aria-hidden="true"
+        >
+          <g className="ring-a">
+            <circle cx={cx} cy={cx} r={whirlSize * 0.457}
+                    fill="none" stroke="oklch(0.22 0.005 90 / 0.55)"
+                    strokeWidth={1.25} strokeLinecap="round"
+                    strokeDasharray="60 40 24 60 14 200 38 70" pathLength="600"/>
+            <circle cx={cx} cy={cx} r={whirlSize * 0.457}
+                    fill="none" stroke="oklch(0.22 0.005 90 / 0.25)"
+                    strokeWidth={0.75} strokeLinecap="round"
+                    strokeDasharray="6 12" pathLength="600"/>
+          </g>
+          <g className="ring-b">
+            <circle cx={cx} cy={cx} r={whirlSize * 0.421}
+                    fill="none" stroke="oklch(0.22 0.005 90 / 0.4)"
+                    strokeWidth={0.9} strokeLinecap="round"
+                    strokeDasharray="2 10 28 90 4 12 60 30" pathLength="500"/>
+            <circle className="mote" cx={cx} cy={whirlSize * 0.078} r={whirlSize * 0.0057}/>
+            <circle className="mote" cx={whirlSize * 0.921} cy={cx} r={whirlSize * 0.0043}/>
+            <circle className="mote" cx={cx} cy={whirlSize * 0.921} r={whirlSize * 0.0036}/>
+            <circle className="mote" cx={whirlSize * 0.078} cy={cx} r={whirlSize * 0.005}/>
+          </g>
+          <g className="ring-c">
+            <circle cx={cx} cy={cx} r={whirlSize * 0.485}
+                    fill="none" stroke="oklch(0.22 0.005 90 / 0.18)"
+                    strokeWidth={0.6} strokeLinecap="round"
+                    strokeDasharray="1 9" pathLength="700"/>
+            <circle className="mote" cx={cx} cy={whirlSize * 0.014} r={whirlSize * 0.0036}/>
+            <circle className="mote" cx={whirlSize * 0.985} cy={cx} r={whirlSize * 0.0036}/>
+            <circle className="mote" cx={cx} cy={whirlSize * 0.985} r={whirlSize * 0.0036}/>
+            <circle className="mote" cx={whirlSize * 0.014} cy={cx} r={whirlSize * 0.0036}/>
+          </g>
+        </svg>
+      )}
+      <svg
+        ref={svgRef}
+        className="globe"
+        width={W}
+        height={H}
+        viewBox={`0 0 ${W} ${H}`}
+        aria-hidden="true"
+      >
+        <defs>
+          <radialGradient id="shade" cx="38%" cy="36%" r="70%">
+            <stop offset="0%"   stopColor="oklch(0.97 0.005 90)" stopOpacity="0.35"/>
+            <stop offset="55%"  stopColor="oklch(0.97 0.005 90)" stopOpacity="0"/>
+            <stop offset="100%" stopColor="oklch(0.10 0.005 90)" stopOpacity="0.20"/>
+          </radialGradient>
+          <clipPath id="diskClip">
+            <circle cx={W/2} cy={H/2} r={R}/>
+          </clipPath>
+        </defs>
+        <circle className="sphere" cx={W/2} cy={H/2} r={R}/>
+        <g clipPath="url(#diskClip)">
+          <path ref={gratRef} className="graticule"/>
+          <path ref={landRef} className="land"/>
+          <circle className="shade" cx={W/2} cy={H/2} r={R}/>
+        </g>
+      </svg>
+    </div>
+  );
+}
+
+function App() {
+  const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+
+  return (
+    <>
+      <GlobeLoader
+        size={tweaks.size}
+        spinSpeed={tweaks.spinSpeed}
+        autoSpin={tweaks.autoSpin}
+        whirl={tweaks.whirl}
+        whirlScale={tweaks.whirlScale}
+      />
+      <TweaksPanel title="Tweaks">
+        <TweakSection label="Globe">
+          <TweakSlider
+            label="Size"
+            value={tweaks.size}
+            min={120} max={640} step={4}
+            onChange={(v) => setTweak('size', v)}
+            unit="px"
+          />
+          <TweakSlider
+            label="Spin speed"
+            value={tweaks.spinSpeed}
+            min={0} max={120} step={1}
+            onChange={(v) => setTweak('spinSpeed', v)}
+            unit="°/s"
+          />
+          <TweakToggle
+            label="Auto-spin"
+            value={tweaks.autoSpin}
+            onChange={(v) => setTweak('autoSpin', v)}
+          />
+        </TweakSection>
+        <TweakSection label="Whirl">
+          <TweakToggle
+            label="Show whirl"
+            value={tweaks.whirl}
+            onChange={(v) => setTweak('whirl', v)}
+          />
+          <TweakSlider
+            label="Whirl scale"
+            value={tweaks.whirlScale}
+            min={0.8} max={1.8} step={0.02}
+            onChange={(v) => setTweak('whirlScale', v)}
+          />
+        </TweakSection>
+        <div style={{
+          marginTop: 8,
+          fontSize: 11,
+          opacity: 0.6,
+          lineHeight: 1.4,
+        }}>
+          Tip: click and drag the globe to rotate it on any axis.
+        </div>
+      </TweaksPanel>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
